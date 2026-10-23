@@ -12,7 +12,7 @@ A checksum-pinned, ARM64 recovery package for restoring the local **Vocalinux 0.
 2. Run `recovery/restore-vocalinux.sh` once from a terminal. It downloads the package from the matching GitHub Release if it is not already beside the script, verifies all checksums, asks for sudo authorization, installs the package and required SteamOS dependencies, and creates Desktop/application-menu shortcuts.
 3. After a later SteamOS update, click **Restore Vocalinux** on the Desktop or find it in the application menu. Enter your sudo password in the Konsole window.
 
-The app package and wake-word models are pinned in this repository/release. Internet is needed only if pacman has to reinstall system dependencies removed by SteamOS. The script makes the root filesystem writable as required by SteamOS package installation.
+The wake-word models and recovery files are in the repository; the first restore downloads the package from the GitHub Release and caches it beside the script. Later restores reuse that local package. Internet is needed after that only if pacman has to reinstall system dependencies removed by SteamOS. The script makes the root filesystem writable as required by SteamOS package installation.
 
 ## Recovery bundle
 

@@ -7,8 +7,9 @@ settings, restores Hey Jarvis assets/autostart, then starts Vocalinux.
 
 The ready-to-install ARM64 package and wake-word models are stored locally, so
 the app itself does not need to be rebuilt. If the package is missing, the
-script downloads it from the public recovery release. Internet is needed only
-if SteamOS removed system dependencies that pacman must reinstall.
+script downloads it from the public recovery release. The first restore from a
+fresh clone needs internet for that download; later restores use the cached
+package and need internet only if pacman must reinstall removed dependencies.
 
 Public source and releases:
 https://github.com/hihowubduin/steamos-vocalinux-wakeword-recovery
