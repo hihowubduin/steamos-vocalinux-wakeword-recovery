@@ -1,0 +1,202 @@
+# Authoritative distro package inventory for install.sh.
+#
+# Edit this file, then run `just distro-packages`. The installer consumes the
+# generated install.d/package_map.sh and never needs a YAML parser at runtime.
+# The remote bootstrap's git package is the one deliberate exception: it must
+# be installed before the tagged repository and this generated map are present.
+schema_version: 1
+
+distributions:
+  ubuntu:
+    # libssl/autotools/libtool/patchelf support pywhispercpp source builds.
+    system:
+      - python3-pip
+      - python3-gi
+      - python3-gi-cairo
+      - gir1.2-gtk-3.0
+      - gir1.2-ibus-1.0
+      - libcairo2-dev
+      - cmake
+      - python3-dev
+      - build-essential
+      - portaudio19-dev
+      - python3-venv
+      - pkg-config
+      - wget
+      - curl
+      - unzip
+      - vulkan-tools
+      - libvulkan-dev
+      - xclip
+      - xsel
+      - wl-clipboard
+      - libssl-dev
+      - autoconf
+      - automake
+      - libtool
+      - patchelf
+    appindicator: [gir1.2-appindicator3-0.1, gir1.2-ayatanaappindicator3-0.1]
+    gi_development: [libgirepository-2.0-dev, libgirepository1.0-dev]
+    shader_compiler: [glslc, glslang-tools]
+    optional_system: [util-linux-extra]
+    text_input:
+      xdotool: [xdotool]
+      wtype: [wtype]
+      ydotool: [ydotool]
+
+  debian_12:
+    system:
+      - python3-pip
+      - python3-gi
+      - python3-gi-cairo
+      - gir1.2-gtk-3.0
+      - gir1.2-ibus-1.0
+      - libcairo2-dev
+      - cmake
+      - python3-dev
+      - build-essential
+      - portaudio19-dev
+      - python3-venv
+      - pkg-config
+      - wget
+      - curl
+      - unzip
+      - vulkan-tools
+      - libvulkan-dev
+      - xclip
+      - xsel
+      - wl-clipboard
+      - libssl-dev
+      - autoconf
+      - automake
+      - libtool
+      - patchelf
+      - libgirepository1.0-dev
+      - gir1.2-ayatanaappindicator3-0.1
+    shader_compiler: [glslc, glslang-tools]
+    optional_system: [util-linux-extra]
+    text_input:
+      xdotool: [xdotool]
+      wtype: [wtype]
+      ydotool: [ydotool]
+
+  debian_13_plus:
+    # Used only to distinguish Debian 13-based derivatives whose own
+    # VERSION_ID does not match the Debian base release.
+    selection_probe: libgirepository-2.0-dev
+    system:
+      - python3-pip
+      - python3-gi
+      - python3-gi-cairo
+      - gir1.2-gtk-3.0
+      - gir1.2-ibus-1.0
+      - libcairo2-dev
+      - cmake
+      - python3-dev
+      - build-essential
+      - portaudio19-dev
+      - python3-venv
+      - pkg-config
+      - wget
+      - curl
+      - unzip
+      - vulkan-tools
+      - libvulkan-dev
+      - xclip
+      - xsel
+      - wl-clipboard
+      - libssl-dev
+      - autoconf
+      - automake
+      - libtool
+      - patchelf
+      - libgirepository-2.0-dev
+      - gir1.2-ayatanaappindicator3-0.1
+    shader_compiler: [glslc, glslang-tools]
+    optional_system: [util-linux-extra]
+    text_input:
+      xdotool: [xdotool]
+      wtype: [wtype]
+      ydotool: [ydotool]
+
+  fedora:
+    # cairo-devel is needed because the pinned pycairo builds from source.
+    # gcc-c++/make compile the pywhispercpp sdist (the wheel SIGILLs on old CPUs)
+    # and the evdev/PyAudio sdists; python3-devel only guarantees gcc.
+    system: [python3-pip, python3-gobject, gtk3, ibus-devel, gobject-introspection-devel, python3-devel, portaudio-devel, cairo-devel, python3-virtualenv, pkg-config, cmake, gcc-c++, make, wget, curl, unzip, vulkan-tools, vulkan-loader-devel, glslc, patchelf, xclip, xsel, wl-clipboard]
+    appindicator: [libayatana-appindicator-gtk3, libappindicator-gtk3]
+    text_input:
+      xdotool: [xdotool]
+      wtype: [wtype]
+      ydotool: [ydotool]
+
+  arch:
+    system: [python-pip, python-gobject, gtk3, ibus, gobject-introspection, python-cairo, portaudio, python-virtualenv, pkg-config, cmake, wget, curl, unzip, base-devel, vulkan-tools, vulkan-headers, shaderc, patchelf, xclip, xsel, wl-clipboard]
+    appindicator: [libayatana-appindicator, libappindicator-gtk3]
+    text_input:
+      xdotool: [xdotool]
+      wtype: [wtype]
+      ydotool: [ydotool]
+
+  suse:
+    # IBus is a runtime dependency; ibus-devel drags in an unsatisfiable gtk-doc
+    # chain on Tumbleweed. The compilers build evdev and PyAudio from sdists.
+    # cairo-devel is needed because the pinned pycairo builds from source.
+    system: [gtk3, ibus, typelib-1_0-IBus-1_0, gobject-introspection-devel, portaudio-devel, cairo-devel, pkg-config, cmake, gcc, gcc-c++, make, wget, curl, unzip, xclip, xsel, wl-clipboard, typelib-1_0-Notify-0_7, libnotify4, patchelf]
+    appindicator: [typelib-1_0-AyatanaAppIndicator3-0_1, typelib-1_0-AppIndicator3-0_1, typelib-1_0-AyatanaAppIndicator-0_1, libayatana-appindicator3-1, libappindicator3-1, libappindicator-gtk3]
+    python_packages:
+      pip: pip
+      gobject: gobject
+      gobject_cairo: gobject-cairo
+      devel: devel
+      virtualenv: virtualenv
+      venv: venv
+    vulkan: [vulkan-tools, vulkan-devel]
+    shader_compiler: [shaderc, glslang-devel, glslang]
+    text_input:
+      xdotool: [xdotool]
+      wtype: [wtype]
+      ydotool: [ydotool]
+
+  gentoo:
+    system: [dev-python/pygobject:3, x11-libs/gtk+:3, dev-libs/libayatana-appindicator, media-libs/portaudio, dev-lang/python:3.11, pkgconf, cmake, media-libs/shaderc, dev-util/patchelf, x11-misc/xclip, x11-misc/xsel, gui-apps/wl-clipboard]
+    text_input:
+      xdotool: [x11-misc/xdotool]
+      wtype: [x11-misc/wtype]
+      ydotool: [app-misc/ydotool]
+
+  alpine:
+    # cairo-dev is needed because the pinned pycairo builds from source.
+    # build-base compiles the pywhispercpp sdist and the evdev/PyAudio sdists.
+    system: [py3-gobject3, py3-pip, gtk+3.0, py3-cairo, portaudio-dev, cairo-dev, py3-virtualenv, pkgconf, cmake, build-base, wget, curl, unzip, shaderc, patchelf, vulkan-tools, xclip, xsel, wl-clipboard]
+    text_input:
+      xdotool: [xdotool]
+      wtype: [wtype]
+      ydotool: [ydotool]
+
+  void:
+    # cairo-devel is needed because the pinned pycairo builds from source.
+    # base-devel compiles the pywhispercpp sdist and the evdev/PyAudio sdists.
+    system: [python3-pip, python3-gobject, gtk+3, libappindicator-gtk3, gobject-introspection, portaudio-devel, cairo-devel, python3-devel, pkg-config, cmake, base-devel, wget, curl, unzip, shaderc, patchelf, Vulkan-Tools, xclip, xsel, wl-clipboard]
+    text_input:
+      xdotool: [xdotool]
+      wtype: [wtype]
+      ydotool: [ydotool]
+
+  solus:
+    # cairo-devel is needed because the pinned pycairo builds from source.
+    # gcc/g++/make compile the pywhispercpp sdist and the evdev/PyAudio sdists.
+    system: [python3-pip, python3-gobject, gtk3, libappindicator, gobject-introspection-devel, portaudio-devel, cairo-devel, python3-virtualenv, pkg-config, cmake, gcc, g++, make, wget, curl, unzip, shaderc, patchelf, vulkan-tools, xclip, xsel, wl-clipboard]
+    text_input:
+      xdotool: [xdotool]
+      wtype: [wtype]
+      ydotool: [ydotool]
+
+  mageia:
+    # The existing installer deliberately follows Fedora's package inventory,
+    # including gcc-c++/make for the pywhispercpp sdist compile.
+    system: [python3-pip, python3-gobject, gtk3, ibus-devel, gobject-introspection-devel, python3-devel, portaudio-devel, cairo-devel, python3-virtualenv, pkg-config, cmake, gcc-c++, make, wget, curl, unzip, vulkan-tools, vulkan-loader-devel, glslc, patchelf, xclip, xsel, wl-clipboard]
+    text_input:
+      xdotool: [xdotool]
+      wtype: [wtype]
+      ydotool: [ydotool]

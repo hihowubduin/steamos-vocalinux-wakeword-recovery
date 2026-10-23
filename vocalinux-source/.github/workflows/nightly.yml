@@ -1,0 +1,316 @@
+name: Nightly Build
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:  # Allow manual triggering for testing
+
+permissions:
+  contents: write  # Required to create/update releases
+
+jobs:
+  nightly:
+    name: Build and Publish Nightly
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      release_tag: ${{ steps.create_release.outputs.tag }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel build twine
+
+      # Stamped before the build, not patched into the filename after it.
+      # pyproject.toml takes the version from `vocalinux.version.__version__`
+      # (tool.setuptools.dynamic), so renaming the wheel left its own metadata
+      # saying 0.16.1 while the filename claimed 0.16.1.dev<date>+<sha>. pip
+      # tolerated that; uv rejects it as a malformed wheel, and the AppImage
+      # build has installed with uv since #743 — which is what broke nightly.
+      # __version_info__ is deliberately left alone: a dev/local suffix has no
+      # meaningful place in a numeric tuple, and nothing builds from it.
+      - name: Stamp the nightly version
+        id: version
+        run: |
+          set -euo pipefail
+          BASE_VERSION=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/vocalinux/version.py)
+          DATE=$(date +%Y%m%d)
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          NIGHTLY_VERSION="${BASE_VERSION}.dev${DATE}+${SHORT_SHA}"
+
+          sed -i "s/^__version__ = \".*\"$/__version__ = \"${NIGHTLY_VERSION}\"/" src/vocalinux/version.py
+          grep -q "^__version__ = \"${NIGHTLY_VERSION}\"$" src/vocalinux/version.py
+
+          echo "version=${NIGHTLY_VERSION}" >> $GITHUB_OUTPUT
+          echo "base_version=${BASE_VERSION}" >> $GITHUB_OUTPUT
+          echo "date=${DATE}" >> $GITHUB_OUTPUT
+          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "Building version: ${NIGHTLY_VERSION}"
+
+      - name: Build package
+        run: |
+          python -m build
+          ls -la dist/
+
+      # glslc and the pywhispercpp Vulkan rebuild are native artifacts. Neither
+      # depends on this commit: the id script keys them to the base image,
+      # tool_checksums.txt, and the pywhispercpp pin.
+      - name: AppImage native cache id
+        id: native-cache
+        run: |
+          set -euo pipefail
+          id="$(bash packaging/appimage/native-cache-id.sh)"
+          echo "id=${id}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache AppImage build tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/vocalinux-appimage
+          key: appimage-native-${{ runner.arch }}-${{ steps.native-cache.outputs.id }}
+
+      - name: Build AppImage (x86_64)
+        env:
+          VOCALINUX_APPIMAGE_REQUIRE_VULKAN: "1"
+        run: |
+          bash packaging/appimage/docker-build.sh dist/*.whl "${{ steps.version.outputs.version }}" dist
+          ls -la dist/*.AppImage
+
+      - name: Cleanup old nightly releases
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Calculate the cutoff date (3 days ago) in seconds since epoch
+          CUTOFF_DATE=$(date -d '3 days ago' +%s)
+          echo "Cutoff date: $(date -d @$CUTOFF_DATE -u +"%Y-%m-%d %H:%M:%S UTC") (3 days ago)"
+
+          # Get nightly releases with their actual creation timestamps using JSON output
+          # Filter for releases older than 3 days and delete them
+          gh release list --repo ${{ github.repository }} --json tagName,createdAt --limit 100 | \
+            jq -r '.[] | select(.tagName | startswith("nightly-")) | [.tagName, .createdAt] | @tsv' | \
+            while IFS=$'\t' read -r tag created_at; do
+              # Parse the ISO 8601 date to seconds since epoch
+              RELEASE_DATE=$(date -d "$created_at" +%s 2>/dev/null || echo "0")
+
+              if [ "$RELEASE_DATE" != "0" ] && [ "$RELEASE_DATE" -lt "$CUTOFF_DATE" ]; then
+                echo "Deleting old nightly release: $tag (created: $(date -d @$RELEASE_DATE -u +"%Y-%m-%d %H:%M:%S UTC"))"
+                gh release delete "$tag" --yes --repo ${{ github.repository }} 2>/dev/null || true
+                git push origin :refs/tags/"$tag" 2>/dev/null || true
+                git tag -d "$tag" 2>/dev/null || true
+              else
+                echo "Keeping nightly release: $tag (created: $(date -d @$RELEASE_DATE -u +"%Y-%m-%d %H:%M:%S UTC"))"
+              fi
+            done
+
+      - name: Generate release notes
+        id: release_notes
+        run: |
+          COMMIT_MSG=$(git log -1 --pretty=format:"%s" HEAD)
+          COMMIT_AUTHOR=$(git log -1 --pretty=format:"%an" HEAD)
+          COMMIT_DATE=$(git log -1 --pretty=format:"%ci" HEAD)
+          COMMIT_BODY=$(git log -1 --pretty=format:"%b" HEAD)
+          
+          # Get recent commits (last 10) for changelog
+          RECENT_COMMITS=$(git log --oneline -10 --no-decorate | sed 's/^/- /')
+          
+          # Get changes since last tag (if exists)
+          LAST_TAG=$(git describe --tags --abbrev=0 --match "nightly-*" 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            CHANGES_SINCE=$(git log --oneline "$LAST_TAG"..HEAD --no-decorate | sed 's/^/- /')
+            CHANGES_SECTION="### Changes Since Last Nightly
+          ${CHANGES_SINCE:-"*No new commits since last nightly*"}"
+          else
+            CHANGES_SECTION="### Recent Commits
+          ${RECENT_COMMITS}"
+          fi
+          
+          cat > /tmp/release_notes.md << EOF
+          ## Nightly Build ${{ steps.version.outputs.version }}
+
+          **This is a nightly development build. It may contain bugs or incomplete features. Use at your own risk.**
+
+          ---
+
+          ### What's in This Build
+
+          **Commit Details:**
+          - **SHA:** \`${{ steps.version.outputs.sha }}\`
+          - **Message:** ${COMMIT_MSG}
+          - **Author:** ${COMMIT_AUTHOR}
+          - **Date:** ${COMMIT_DATE}
+
+          ${CHANGES_SECTION}
+
+          ---
+
+          ### Installation
+
+          #### Quick Install (Recommended)
+          Download the wheel file below and install:
+          \`\`\`bash
+          pip install vocalinux-${{ steps.version.outputs.version }}-py3-none-any.whl
+          \`\`\`
+
+          #### From PyPI (Stable)
+          For the latest stable release:
+          \`\`\`bash
+          pip install vocalinux
+          \`\`\`
+
+          #### Using Install Script
+          \`\`\`bash
+          curl -fsSL https://raw.githubusercontent.com/VocaHQ/vocalinux/main/install.sh | bash
+          \`\`\`
+
+          #### AppImage (no install, no root)
+          Download the \`.AppImage\` matching your CPU (\`x86_64\` or \`aarch64\`) below:
+          \`\`\`bash
+          chmod +x Vocalinux-${{ steps.version.outputs.version }}-x86_64.AppImage
+          ./Vocalinux-${{ steps.version.outputs.version }}-x86_64.AppImage
+          \`\`\`
+          Requires \`xdotool\`/\`wtype\`/\`ydotool\` on the host for text injection, same as the PyPI install path.
+
+          ---
+
+          ### Build Information
+
+          | Property | Value |
+          |----------|-------|
+          | **Version** | ${{ steps.version.outputs.version }} |
+          | **Base Version** | ${{ steps.version.outputs.base_version }} |
+          | **Build Date** | ${{ steps.version.outputs.date }} |
+          | **Python** | 3.11+ |
+          | **OS** | Linux (X11 & Wayland) |
+
+          ---
+
+          ### Files
+
+          - **\`vocalinux-${{ steps.version.outputs.version }}-py3-none-any.whl\`** - Python wheel (recommended)
+          - **\`vocalinux-${{ steps.version.outputs.version }}.tar.gz\`** - Source distribution
+          - **\`Vocalinux-${{ steps.version.outputs.version }}-x86_64.AppImage\`** - Self-contained, no install (Intel/AMD)
+          - **\`Vocalinux-${{ steps.version.outputs.version }}-aarch64.AppImage\`** - Self-contained, no install (ARM64, added shortly after this release is published)
+
+          ---
+
+          ### Links
+
+          - [Documentation](https://vocalinux.com)
+          - [Report Issues](https://github.com/VocaHQ/vocalinux/issues)
+          - [Other Releases](https://github.com/VocaHQ/vocalinux/releases)
+
+          ---
+
+          *Only the 3 most recent nightly builds are kept. This build will be automatically deleted when newer nightlies are created.*
+          
+          *Generated on $(date -u +"%Y-%m-%d %H:%M:%S UTC")*
+          EOF
+          echo "notes_file=/tmp/release_notes.md" >> $GITHUB_OUTPUT
+
+      - name: Create nightly release
+        id: create_release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Create release with dated tag: nightly-2025-02-11
+          RELEASE_TAG="nightly-$(date +%Y-%m-%d)"
+
+          # If a release for today already exists, delete it first
+          gh release delete "$RELEASE_TAG" --yes --repo ${{ github.repository }} 2>/dev/null || true
+          git push origin :refs/tags/"$RELEASE_TAG" 2>/dev/null || true
+          git tag -d "$RELEASE_TAG" 2>/dev/null || true
+
+          gh release create "$RELEASE_TAG" \
+            --title "Nightly Build - ${{ steps.version.outputs.version }}" \
+            --notes-file ${{ steps.release_notes.outputs.notes_file }} \
+            --prerelease \
+            dist/*
+
+          echo "tag=${RELEASE_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifacts (backup)
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vocalinux-nightly-${{ steps.version.outputs.version }}
+          path: dist/
+          retention-days: 7
+
+  nightly-appimage-arm64:
+    name: Build and Attach Nightly AppImage (aarch64)
+    runs-on: ubuntu-24.04-arm
+    needs: nightly
+    if: needs.nightly.result == 'success'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip setuptools wheel build
+
+      # This job builds its own wheel, so it needs the same stamp: without it
+      # the aarch64 AppImage bundles a wheel calling itself 0.16.1 while the
+      # release it is attached to is 0.16.1.dev<date>+<sha>.
+      - name: Stamp the nightly version
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.nightly.outputs.version }}"
+          sed -i "s/^__version__ = \".*\"$/__version__ = \"${VERSION}\"/" src/vocalinux/version.py
+          grep -q "^__version__ = \"${VERSION}\"$" src/vocalinux/version.py
+
+      - name: Build package
+        run: |
+          python -m build
+          ls -la dist/
+
+      # glslc and the pywhispercpp Vulkan rebuild are native artifacts. Neither
+      # depends on this commit: the id script keys them to the base image,
+      # tool_checksums.txt, and the pywhispercpp pin.
+      - name: AppImage native cache id
+        id: native-cache
+        run: |
+          set -euo pipefail
+          id="$(bash packaging/appimage/native-cache-id.sh)"
+          echo "id=${id}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache AppImage build tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/vocalinux-appimage
+          key: appimage-native-${{ runner.arch }}-${{ steps.native-cache.outputs.id }}
+
+      - name: Build AppImage (aarch64)
+        env:
+          VOCALINUX_APPIMAGE_REQUIRE_VULKAN: "1"
+        run: |
+          bash packaging/appimage/docker-build.sh dist/*.whl "${{ needs.nightly.outputs.version }}" dist
+          ls -la dist/*.AppImage
+
+      - name: Attach to nightly release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.nightly.outputs.release_tag }}" \
+            dist/*.AppImage \
+            --repo ${{ github.repository }} \
+            --clobber

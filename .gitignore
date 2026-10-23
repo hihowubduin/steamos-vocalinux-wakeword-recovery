@@ -1,0 +1,11 @@
+# AppImage package is distributed as the v0.18.4-2 GitHub Release asset.
+/recovery/vocalinux-bin-0.18.4-2-aarch64.pkg.tar.zst
+
+# Local build and editor state.
+**/__pycache__/
+**/.pytest_cache/
+**/.venv/
+**/venv/
+**/dist/
+**/build/
+**/node_modules/

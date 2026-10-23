@@ -1,0 +1,1166 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Least privilege, granted per job. `id-token: write` at the top level handed an
+# OIDC token to every job in the workflow, including publish-aur, which runs a
+# third-party action with our AUR signing key.
+permissions:
+  contents: read
+
+env:
+  # Build against the supported floor (requires-python in pyproject.toml).
+  PYTHON_VERSION: '3.11'
+  # The dedicated "tap" repo and the URL Pages serves it at. A custom
+  # domain (e.g. flatpak.vocalinux.com) overrides both via the vars.
+  FLATPAK_REMOTE_REPO: ${{ vars.FLATPAK_REMOTE_REPO || 'VocaHQ/vocalinux-flatpak' }}
+  FLATPAK_REMOTE_URL: ${{ vars.FLATPAK_REMOTE_URL || 'https://vocahq.github.io/vocalinux-flatpak/repo' }}
+  FLATPAKREPO_URL: ${{ vars.FLATPAKREPO_URL || 'https://vocahq.github.io/vocalinux-flatpak/vocahq.flatpakrepo' }}
+  FLATPAKREF_URL: ${{ vars.FLATPAKREF_URL || 'https://vocahq.github.io/vocalinux-flatpak/com.vocalinux.Vocalinux.flatpakref' }}
+
+jobs:
+  build-and-release:
+    name: Build and Create Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install build wheel setuptools
+
+      - name: Extract version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Verify version consistency
+        run: |
+          # Get version from version.py file directly (avoid importing full package which needs gi)
+          PACKAGE_VERSION=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/vocalinux/version.py)
+          TAG_VERSION=${{ steps.get_version.outputs.VERSION }}
+          echo "Package version: $PACKAGE_VERSION"
+          echo "Tag version: $TAG_VERSION"
+          # Allow alpha/beta suffixes in package version
+          if [[ ! "$PACKAGE_VERSION" == *"$TAG_VERSION"* ]] && [[ ! "$TAG_VERSION" == *"$PACKAGE_VERSION"* ]]; then
+            echo "Warning: Version mismatch between tag ($TAG_VERSION) and package ($PACKAGE_VERSION)"
+          fi
+
+      # Archive timestamps are what made two builds of one tag differ. Pinned to
+      # the tagged commit, re-running this workflow reproduces the bytes we
+      # published, so a checksum stays true for the life of the release.
+      - name: Pin the build timestamp to the tagged commit
+        run: |
+          echo "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct "$GITHUB_SHA")" >> "$GITHUB_ENV"
+
+      # The only `python -m build` in this workflow. PyPI, the aarch64 AppImage
+      # and the checksums all consume the artifact below, so the wheel on PyPI
+      # is the wheel on the release. It used to be built three times, on three
+      # runners, and nothing guaranteed the three agreed.
+      - name: Build package
+        run: |
+          python -m build
+          echo "Built packages:"
+          ls -la dist/
+
+      - name: Upload the built distributions
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: python-dist
+          path: |
+            dist/*.whl
+            dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+      # glslc and the pywhispercpp Vulkan rebuild are native artifacts. Neither
+      # depends on this commit: the id script keys them to the base image,
+      # tool_checksums.txt, and the pywhispercpp pin.
+      - name: AppImage native cache id
+        id: native-cache
+        run: |
+          set -euo pipefail
+          id="$(bash packaging/appimage/native-cache-id.sh)"
+          echo "id=${id}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache AppImage build tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/vocalinux-appimage
+          key: appimage-native-${{ runner.arch }}-${{ steps.native-cache.outputs.id }}
+
+      - name: Build AppImage (x86_64)
+        env:
+          VOCALINUX_APPIMAGE_REQUIRE_VULKAN: "1"
+        run: |
+          bash packaging/appimage/docker-build.sh dist/*.whl "${{ steps.get_version.outputs.VERSION }}" dist
+          ls -la dist/*.AppImage
+
+      - name: Upload the x86_64 AppImage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: appimage-x86_64
+          path: dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
+
+      # The remote install commands only belong in the notes when this tag
+      # will actually publish the remote — the same two gates
+      # publish-flatpak-remote applies: a stable tag and both secrets
+      # configured. Otherwise the notes would send users to a remote that
+      # never carries this release, so they get the bundle path alone.
+      - name: Compose the Flatpak install notes
+        id: flatpak_notes
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_REPO_TOKEN: ${{ secrets.FLATPAK_REPO_TOKEN }}
+          VERSION: ${{ steps.get_version.outputs.VERSION }}
+        run: |
+          set -euo pipefail
+          notes="$RUNNER_TEMP/flatpak-notes.md"
+          case "$GITHUB_REF_NAME" in
+            *alpha*|*beta*|*rc*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+          if [ "$prerelease" = false ] && [ -n "$FLATPAK_GPG_PRIVATE_KEY" ] && [ -n "$FLATPAK_REPO_TOKEN" ]; then
+            cat >"$notes" <<'EOF'
+          ### Flatpak
+          Install and auto-update via the self-hosted VocaHQ remote (`flatpak update`
+          picks up each release):
+          ```bash
+          flatpak install __FLATPAKREF_URL__
+          ```
+          The `.flatpakref` adds the `vocahq` remote and resolves `org.gnome.Platform//50`
+          through Flathub itself — no separate Flathub setup needed. To add the
+          pieces by hand instead:
+          ```bash
+          flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak remote-add --if-not-exists vocahq __FLATPAKREPO_URL__
+          flatpak install vocahq com.vocalinux.Vocalinux
+          ```
+
+          Or download the `.flatpak` matching your CPU (`x86_64` or `aarch64`, attached
+          shortly after this release is published) — a bundle with **no auto-update**:
+          ```bash
+          # once: Flathub remote + GNOME runtime (the app itself is not on Flathub)
+          flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install flathub org.gnome.Platform//50
+
+          flatpak install --user ./Vocalinux-__VERSION__-x86_64.flatpak
+          flatpak run com.vocalinux.Vocalinux
+          ```
+          EOF
+          else
+            cat >"$notes" <<'EOF'
+          ### Flatpak
+          Download the `.flatpak` matching your CPU (`x86_64` or `aarch64`, attached
+          shortly after this release is published) — a bundle with **no auto-update**:
+          ```bash
+          # once: Flathub remote + GNOME runtime (the app itself is not on Flathub)
+          flatpak remote-add --if-not-exists flathub https://dl.flathub.org/repo/flathub.flatpakrepo
+          flatpak install flathub org.gnome.Platform//50
+
+          flatpak install --user ./Vocalinux-__VERSION__-x86_64.flatpak
+          flatpak run com.vocalinux.Vocalinux
+          ```
+          EOF
+            if [ "$prerelease" = true ]; then
+              cat >>"$notes" <<'EOF'
+          Prereleases are not pushed to the `vocahq` auto-update remote — `flatpak update`
+          there stays on the latest stable release.
+          EOF
+            fi
+          fi
+          cat >>"$notes" <<'EOF'
+          Whisper.cpp engine only. Hotkeys need device access as documented in
+          packaging/flatpak/README.md. Not on Flathub (https://github.com/flathub/flathub/pull/9368).
+          EOF
+          sed -i \
+            -e "s|__VERSION__|$VERSION|g" \
+            -e "s|__FLATPAKREPO_URL__|$FLATPAKREPO_URL|g" \
+            -e "s|__FLATPAKREF_URL__|$FLATPAKREF_URL|g" \
+            "$notes"
+          {
+            echo 'flatpak<<VOCA_NOTES_EOF'
+            cat "$notes"
+            echo 'VOCA_NOTES_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          files: |
+            dist/*.whl
+            dist/*.tar.gz
+            dist/*.AppImage
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref, 'alpha') || contains(github.ref, 'beta') || contains(github.ref, 'rc') }}
+          body: |
+            ## Installation
+
+            ### Quick Install (Recommended)
+            ```bash
+            curl -fsSL https://raw.githubusercontent.com/VocaHQ/vocalinux/${{ github.ref_name }}/install.sh | bash
+            ```
+
+            ### From Source
+            ```bash
+            git clone https://github.com/VocaHQ/vocalinux.git
+            cd vocalinux
+            ./install.sh
+            ```
+
+            ### From PyPI
+            ```bash
+            # Install the Linux system packages first:
+            # GTK/AppIndicator, PortAudio, and xdotool/wtype are required.
+            python3 -m venv ~/.local/share/vocalinux-pypi/venv --system-site-packages
+            source ~/.local/share/vocalinux-pypi/venv/bin/activate
+            pip install vocalinux
+            vocalinux
+            ```
+
+            PyPI installs the Python package only. For automatic system dependency,
+            desktop integration, and model setup, use the Quick Install command above.
+            See docs/INSTALL.md for distro-specific PyPI prerequisites.
+
+            ### Arch Linux (AUR)
+            ```bash
+            yay -S vocalinux
+            ```
+
+            ### AppImage (no install, no root)
+            Download the `.AppImage` matching your CPU (`x86_64` or `aarch64`, the latter attached
+            shortly after this release is published) below:
+            ```bash
+            chmod +x Vocalinux-${{ steps.get_version.outputs.VERSION }}-x86_64.AppImage
+            ./Vocalinux-${{ steps.get_version.outputs.VERSION }}-x86_64.AppImage
+            ```
+            Still requires `xdotool`/`wtype`/`ydotool` on the host for text injection, same as the PyPI path.
+
+            ### Distro packages (.deb / .rpm)
+            Download the package matching your distro and CPU (`amd64`/`x86_64`, or `arm64`/`aarch64`
+            attached shortly after this release is published):
+            ```bash
+            # Debian / Ubuntu
+            sudo apt install ./vocalinux_*_amd64.deb
+
+            # Fedora
+            sudo dnf install ./vocalinux-*.x86_64.rpm
+            ```
+            Thin packages: Python, GTK, PyGObject and the AppIndicator typelib come from the
+            distro, and `apt`/`dnf` resolves them. Only `pywhispercpp` and `pynput` are
+            vendored (the first is packaged by neither distro, the second is missing on
+            Fedora). whisper.cpp runs on CPU in these packages; the Vulkan build is the
+            AppImage. A PPA and a COPR are not published yet.
+
+            On Wayland the default Right Alt hotkey uses evdev: `sudo usermod -aG input $USER`,
+            then log out and back in (the `input` group can read every keyboard and pointer
+            device; X11 needs nothing).
+
+            ${{ steps.flatpak_notes.outputs.flatpak }}
+
+            ### Snap
+            Tagged releases also attach `vocalinux_${{ steps.get_version.outputs.VERSION }}_amd64.snap`
+            and try the Snap Store (`edge` and `candidate`). `stable` is promoted
+            from candidate after QA by the `snap-promote.yml` dispatch workflow.
+            Wayland typing runs through the RemoteDesktop portal; the snap ships no `uinput` plug.
+            The GitHub `.snap` is also the sideload while a Store revision lags:
+            ```bash
+            sudo snap install --dangerous ./vocalinux_${{ steps.get_version.outputs.VERSION }}_amd64.snap
+            ```
+            `--dangerous` is required because this file is not a Store revision. It will not
+            refresh from the Store. amd64 only.
+
+            ### Verifying what you downloaded
+            `SHA256SUMS` covers every file here and is attached once the aarch64 AppImage,
+            both Flatpak builds, and the snap finish, a few minutes after this release appears.
+            The wheel and the sdist below are the same bytes published to PyPI.
+            ```bash
+            sha256sum -c --ignore-missing SHA256SUMS
+            ```
+            Each artifact also carries GitHub build provenance, which ties it to this workflow run:
+            ```bash
+            gh attestation verify Vocalinux-${{ steps.get_version.outputs.VERSION }}-x86_64.AppImage \
+              --repo ${{ github.repository }}
+            ```
+
+            ---
+            See [CHANGELOG](https://github.com/VocaHQ/vocalinux/releases) for detailed changes.
+
+  build-appimage-arm64:
+    name: Build and Attach AppImage (aarch64)
+    needs: build-and-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      # The wheel is py3-none-any, so this is the wheel the release and PyPI
+      # carry. Building it again here made a third copy of the same version that
+      # no published checksum could describe.
+      - name: Download the built distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-dist
+          path: dist
+
+      # glslc and the pywhispercpp Vulkan rebuild are native artifacts. Neither
+      # depends on this commit: the id script keys them to the base image,
+      # tool_checksums.txt, and the pywhispercpp pin.
+      - name: AppImage native cache id
+        id: native-cache
+        run: |
+          set -euo pipefail
+          id="$(bash packaging/appimage/native-cache-id.sh)"
+          echo "id=${id}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache AppImage build tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/vocalinux-appimage
+          key: appimage-native-${{ runner.arch }}-${{ steps.native-cache.outputs.id }}
+
+      - name: Build AppImage (aarch64)
+        env:
+          VOCALINUX_APPIMAGE_REQUIRE_VULKAN: "1"
+        run: |
+          bash packaging/appimage/docker-build.sh dist/*.whl "${{ steps.get_version.outputs.VERSION }}" dist
+          ls -la dist/*.AppImage
+
+      - name: Upload the aarch64 AppImage
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: appimage-aarch64
+          path: dist/*.AppImage
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Attach to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            dist/*.AppImage \
+            --repo ${{ github.repository }} \
+            --clobber
+
+  # The .deb and .rpm are thin: they depend on the distro's Python, GTK,
+  # PyGObject and typelibs and vendor only pywhispercpp and pynput (#600).
+  # nfpm builds both from one config inside the pinned Debian 12 image, and
+  # the same wheel PyPI ships is the payload.
+  build-native:
+    name: Build native packages (x86_64)
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      # Same reason the aarch64 AppImage downloads the artifact: one wheel,
+      # everywhere, or the checksums cannot describe what the packages hold.
+      - name: Download the built distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Build .deb and .rpm
+        run: |
+          bash packaging/native/docker-build.sh dist/*.whl "${{ steps.get_version.outputs.VERSION }}" dist
+          ls -la dist/*.deb dist/*.rpm
+
+      - name: Upload the x86_64 packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-x86_64
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Attach to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            dist/*.deb dist/*.rpm \
+            --repo ${{ github.repository }} \
+            --clobber
+
+  build-native-arm64:
+    name: Build native packages (aarch64)
+    needs: build-and-release
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Download the built distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Build .deb and .rpm (aarch64)
+        run: |
+          bash packaging/native/docker-build.sh dist/*.whl "${{ steps.get_version.outputs.VERSION }}" dist
+          ls -la dist/*.deb dist/*.rpm
+
+      - name: Upload the aarch64 packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-aarch64
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Attach to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            dist/*.deb dist/*.rpm \
+            --repo ${{ github.repository }} \
+            --clobber
+
+  # Pins match .github/workflows/flatpak.yml. These jobs start with the tag
+  # (no needs) so they overlap the wheel / x86_64 AppImage job. The builder
+  # image is Freedesktop SDK, not a GitHub-hosted runner: no `gh`, so attach
+  # is a follow-up job on ubuntu-latest, same `gh release upload --clobber`
+  # as the aarch64 AppImage. The image is digest-pinned: it runs privileged.
+  build-flatpak-amd64:
+    name: Build Flatpak (x86_64)
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50@sha256:1fb2df10a57276f90806e1f35454048e30bf1855b7b4ff4808c9ee55887bd852
+      options: --privileged
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build and bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6
+        with:
+          bundle: Vocalinux-${{ steps.get_version.outputs.VERSION }}-x86_64.flatpak
+          manifest-path: packaging/flatpak/com.vocalinux.Vocalinux.yml
+          # Same prefix rule as flatpak.yml: restore-keys is
+          # `flatpak-builder-${arch}`. The action appends -${arch} again.
+          cache-key: flatpak-builder-x86_64-${{ hashFiles('packaging/flatpak/**') }}
+          arch: x86_64
+          # Pinned actions/upload-artifact below, same digest as AppImage.
+          upload-artifact: false
+          mirror-screenshots-url: https://dl.flathub.org/media
+
+      - name: Upload the x86_64 Flatpak
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flatpak-x86_64
+          path: Vocalinux-${{ steps.get_version.outputs.VERSION }}-x86_64.flatpak
+          if-no-files-found: error
+          retention-days: 7
+
+  build-flatpak-arm64:
+    name: Build Flatpak (aarch64)
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50@sha256:1fb2df10a57276f90806e1f35454048e30bf1855b7b4ff4808c9ee55887bd852
+      options: --privileged
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Extract version from tag
+        id: get_version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build and bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6
+        with:
+          bundle: Vocalinux-${{ steps.get_version.outputs.VERSION }}-aarch64.flatpak
+          manifest-path: packaging/flatpak/com.vocalinux.Vocalinux.yml
+          cache-key: flatpak-builder-aarch64-${{ hashFiles('packaging/flatpak/**') }}
+          arch: aarch64
+          upload-artifact: false
+          mirror-screenshots-url: https://dl.flathub.org/media
+
+      - name: Upload the aarch64 Flatpak
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: flatpak-aarch64
+          path: Vocalinux-${{ steps.get_version.outputs.VERSION }}-aarch64.flatpak
+          if-no-files-found: error
+          retention-days: 7
+
+  # Self-hosted OSTree remote (#785), the Homebrew-tap analogue: the release
+  # bundles are imported into a signed repo and pushed to
+  # VocaHQ/vocalinux-flatpak, which GitHub Pages serves at FLATPAK_REMOTE_URL.
+  # Installs then auto-update via `flatpak update`. One-time setup — repo,
+  # Pages, signing key, PAT — is documented in docs/FLATPAK_REMOTE.md.
+  # build-and-release is a hard requirement: the remote is the update channel
+  # for the GitHub Release, so it must not publish when release creation
+  # failed. Stable tags only — a prerelease on `stable` would land in every
+  # user's `flatpak update`.
+  publish-flatpak-remote:
+    name: Publish Flatpak remote
+    needs: [build-and-release, build-flatpak-amd64, build-flatpak-arm64]
+    if: ${{ !contains(github.ref, 'alpha') && !contains(github.ref, 'beta') && !contains(github.ref, 'rc') }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      # Two tags publishing at once would race each other's gh-pages push.
+      group: flatpak-remote
+    steps:
+      # Same pattern as publish-aur: an unconfigured remote skips the publish
+      # instead of failing the release. The skip is loud — a quiet one let the
+      # documented remote sit unpublished for releases at a time (#951).
+      - name: Check remote credentials
+        id: creds
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_REPO_TOKEN: ${{ secrets.FLATPAK_REPO_TOKEN }}
+        run: |
+          if [ -z "$FLATPAK_GPG_PRIVATE_KEY" ] || [ -z "$FLATPAK_REPO_TOKEN" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            msg="FLATPAK_GPG_PRIVATE_KEY and/or FLATPAK_REPO_TOKEN not set; skipping remote publish — the documented auto-update remote will not carry this release (docs/FLATPAK_REMOTE.md)"
+            echo "::warning::$msg"
+            {
+              echo "### :warning: Flatpak remote publish skipped"
+              echo
+              echo "$msg"
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.creds.outputs.configured == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install repo tooling
+        if: steps.creds.outputs.configured == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak ostree
+
+      - name: Download the Flatpak bundles
+        if: steps.creds.outputs.configured == 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: flatpak-*
+          merge-multiple: true
+          path: dist
+
+      # The import below falls back to `ostree init` when site/repo is absent,
+      # which is only safe on a confirmed first publish: a transient checkout
+      # failure taken as "no history" would publish an empty repo over the
+      # remote and drop every object and delta clients still need. Probe
+      # gh-pages directly — exit 2 means confirmed absent; anything else
+      # aborts instead of guessing.
+      - name: Check whether the remote was published before
+        id: published
+        if: steps.creds.outputs.configured == 'true'
+        env:
+          FLATPAK_REPO_TOKEN: ${{ secrets.FLATPAK_REPO_TOKEN }}
+        run: |
+          set -u
+          rc=0
+          git ls-remote --exit-code --heads \
+            "https://x-access-token:${FLATPAK_REPO_TOKEN}@github.com/${FLATPAK_REMOTE_REPO}.git" \
+            gh-pages >/dev/null 2>&1 || rc=$?
+          case $rc in
+            0) echo "published=true" >> "$GITHUB_OUTPUT" ;;
+            2) echo "published=false" >> "$GITHUB_OUTPUT" ;;
+            *)
+              echo "::error::Could not check ${FLATPAK_REMOTE_REPO} for gh-pages (git ls-remote exited $rc). Does the repo exist (docs/FLATPAK_REMOTE.md)?"
+              exit "$rc"
+              ;;
+          esac
+
+      - name: Fetch the previously published repo
+        if: steps.creds.outputs.configured == 'true' && steps.published.outputs.published == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.FLATPAK_REMOTE_REPO }}
+          ref: gh-pages
+          token: ${{ secrets.FLATPAK_REPO_TOKEN }}
+          path: site
+
+      - name: Import the signing key
+        if: steps.creds.outputs.configured == 'true'
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+          FLATPAK_GPG_PASSPHRASE: ${{ secrets.FLATPAK_GPG_PASSPHRASE }}
+        run: |
+          set -euo pipefail
+          export GNUPGHOME="$RUNNER_TEMP/gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          gpg --batch --import <<<"$FLATPAK_GPG_PRIVATE_KEY"
+          KEYID=$(gpg --batch --with-colons --list-secret-keys | awk -F: '$1 == "sec" {print $5; exit}')
+          KEYGRIP=$(gpg --batch --with-colons --with-keygrip --list-secret-keys | awk -F: '$1 == "grp" {print $10; exit}')
+          if [ -n "${FLATPAK_GPG_PASSPHRASE:-}" ]; then
+            # libostree signs through gpg-agent, so the passphrase has to be
+            # preset on the keygrip — there is no --passphrase-fd to reach for.
+            PRESET=$(command -v gpg-preset-passphrase || find /usr/lib* /usr/libexec -name gpg-preset-passphrase 2>/dev/null | head -1 || true)
+            if [ -z "$PRESET" ]; then
+              echo "::error::FLATPAK_GPG_PASSPHRASE is set but gpg-preset-passphrase is unavailable; import a passphrase-less key instead"
+              exit 1
+            fi
+            echo "allow-preset-passphrase" >> "$GNUPGHOME/gpg-agent.conf"
+            gpgconf --kill gpg-agent || true
+            gpg-agent --daemon
+            printf '%s' "$FLATPAK_GPG_PASSPHRASE" | "$PRESET" --preset "$KEYGRIP"
+          fi
+          gpg --batch --export "$KEYID" > "$RUNNER_TEMP/pubkey.gpg"
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+          echo "KEYID=$KEYID" >> "$GITHUB_ENV"
+
+      # site/repo carries the prior objects back in, so clients pull deltas
+      # per release rather than re-downloading the app.
+      - name: Import bundles and sign the repo
+        if: steps.creds.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          repo="$PWD/publish/repo"
+          if [ -d site/repo/objects ]; then
+            mkdir -p publish
+            cp -a site/repo "$repo"
+          else
+            mkdir -p "$repo"
+            ostree --repo="$repo" init --mode=archive-z2
+          fi
+          # git drops empty directories: a checked-out site/repo lacks
+          # refs/remotes and refs/mirrors, and `build-update-repo
+          # --generate-static-deltas` aborts with
+          # "opendir(refs/remotes): No such file or directory" without them.
+          mkdir -p "$repo/refs/remotes" "$repo/refs/mirrors"
+          ls -la dist/*.flatpak
+          for bundle in dist/*.flatpak; do
+            flatpak build-import-bundle \
+              --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME" \
+              --update-appstream --no-update-summary \
+              "$repo" "$bundle"
+          done
+          flatpak build-update-repo \
+            --gpg-sign="$KEYID" --gpg-homedir="$GNUPGHOME" \
+            --gpg-import="$RUNNER_TEMP/pubkey.gpg" \
+            --default-branch=stable \
+            --generate-static-deltas \
+            "$repo"
+
+      # RuntimeRepo lives on the .flatpakref — it is a "Flatpak Ref" key, not
+      # a "Flatpak Repo" key, so on the .flatpakrepo it was a silent no-op and
+      # clean installs without Flathub could not resolve the GNOME runtime.
+      # Installing the .flatpakref adds the remote and pulls the runtime in
+      # one command. The bare public key ships for remote-modify key rotation.
+      - name: Write the .flatpakrepo, .flatpakref, and index page
+        if: steps.creds.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          touch publish/.nojekyll
+          {
+            echo '[Flatpak Repo]'
+            echo 'Title=VocaHQ'
+            echo "Url=${FLATPAK_REMOTE_URL}"
+            echo 'Homepage=https://vocalinux.com'
+            echo 'Comment=Official Vocalinux Flatpak remote'
+            echo 'Description=Self-hosted Vocalinux Flatpak repository'
+            echo 'Icon=https://vocalinux.com/icon-512x512.png'
+            echo 'DefaultBranch=stable'
+            echo "GPGKey=$(base64 -w0 "$RUNNER_TEMP/pubkey.gpg")"
+          } > publish/vocahq.flatpakrepo
+          {
+            echo '[Flatpak Ref]'
+            echo 'Version=1'
+            echo 'Title=Vocalinux'
+            echo 'Name=com.vocalinux.Vocalinux'
+            echo 'Branch=stable'
+            echo "Url=${FLATPAK_REMOTE_URL}"
+            echo 'SuggestRemoteName=vocahq'
+            echo 'RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo'
+            echo 'IsRuntime=false'
+            echo 'Homepage=https://vocalinux.com'
+            echo 'Icon=https://vocalinux.com/icon-512x512.png'
+            echo "GPGKey=$(base64 -w0 "$RUNNER_TEMP/pubkey.gpg")"
+          } > publish/com.vocalinux.Vocalinux.flatpakref
+          cp "$RUNNER_TEMP/pubkey.gpg" publish/vocahq.gpg
+          grep -v GPGKey publish/vocahq.flatpakrepo
+          sed -e "s|__FLATPAKREPO_URL__|${FLATPAKREPO_URL}|g" \
+              -e "s|__FLATPAKREF_URL__|${FLATPAKREF_URL}|g" \
+              -e "s|__REMOTE_URL__|${FLATPAK_REMOTE_URL}|g" \
+              packaging/flatpak/index.html > publish/index.html
+
+      - name: Publish the remote
+        if: steps.creds.outputs.configured == 'true'
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          personal_token: ${{ secrets.FLATPAK_REPO_TOKEN }}
+          external_repository: ${{ env.FLATPAK_REMOTE_REPO }}
+          publish_dir: ./publish
+          publish_branch: gh-pages
+          commit_message: 'Vocalinux ${{ github.ref_name }}'
+
+  attach-flatpak:
+    name: Attach Flatpak bundles
+    needs: [build-and-release, build-flatpak-amd64, build-flatpak-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the x86_64 Flatpak
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: flatpak-x86_64
+          path: dist
+
+      - name: Download the aarch64 Flatpak
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: flatpak-aarch64
+          path: dist
+
+      - name: Attach to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -la dist/*.flatpak
+          gh release upload "${{ github.ref_name }}" \
+            dist/*.flatpak \
+            --repo ${{ github.repository }} \
+            --clobber
+
+  # Runs last because the aarch64 AppImage, both Flatpak bundles, the native
+  # packages, and the snap land after the release is created: a checksum
+  # manifest that covers some of the files is worse than none, since the
+  # missing one looks like the tampered one.
+  publish-checksums:
+    name: Checksums and Provenance
+    needs: [build-and-release, build-appimage-arm64, build-native, build-native-arm64, build-flatpak-amd64, build-flatpak-arm64, attach-flatpak, attach-snap]
+    runs-on: ubuntu-latest
+    # An attach-job failure must not skip checksums: this job hashes the build
+    # artifacts, which exist regardless of whether an upload to the release
+    # succeeded. A missing build artifact still fails the job via the guard
+    # below, so a partial manifest can never publish.
+    if: ${{ !cancelled() }}
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Collect every artifact this run published
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Require every expected artifact
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          for pat in '*.whl' '*.tar.gz' '*.AppImage' '*.deb' '*.rpm' '*.flatpak' '*.snap'; do
+            compgen -G "$pat" > /dev/null || { echo "missing artifact: $pat"; exit 1; }
+          done
+          test "$(compgen -G '*.AppImage' | wc -l)" -eq 2
+          test "$(compgen -G '*.deb' | wc -l)" -eq 2
+          test "$(compgen -G '*.rpm' | wc -l)" -eq 2
+          test "$(compgen -G '*.flatpak' | wc -l)" -eq 2
+
+      - name: Generate SHA256SUMS
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          ls -la
+          # Bare names, so `sha256sum -c` works in whatever directory the user
+          # downloaded the release into.
+          sha256sum -- *.whl *.tar.gz *.AppImage *.deb *.rpm *.flatpak *.snap | tee SHA256SUMS
+
+      # Attesting from the manifest rather than a second glob: the file we
+      # publish and the set we attest cannot drift apart.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4
+        with:
+          subject-checksums: dist/SHA256SUMS
+
+      - name: Attach SHA256SUMS to the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ github.ref_name }}" \
+            dist/SHA256SUMS \
+            --repo ${{ github.repository }} \
+            --clobber
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # PyPI trusted publishing; there is no API token to leak
+    environment:
+      name: pypi
+      url: https://pypi.org/project/vocalinux/
+    steps:
+      # Not a rebuild: the artifact attached to the GitHub release, so one
+      # checksum describes both.
+      - name: Download the built distributions
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: python-dist
+          path: dist
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Verify package
+        run: |
+          python -m pip install --upgrade pip
+          pip install twine
+          twine check dist/*
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # release/v1
+        with:
+          skip-existing: true
+
+  publish-aur:
+    name: Publish to AUR
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Secrets: AUR_SSH_PRIVATE_KEY, AUR_USERNAME, AUR_EMAIL — see docs/AUR.md
+    steps:
+      - name: Check for AUR credentials
+        id: aur
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "AUR_SSH_PRIVATE_KEY not set; skipping (docs/AUR.md)"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        if: steps.aur.outputs.configured == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Bump PKGBUILD version
+        if: steps.aur.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/v}"
+          for PKGBUILD in packaging/aur/vocalinux/PKGBUILD packaging/aur/vocalinux-bin/PKGBUILD; do
+            sed -i "s/^pkgver=.*/pkgver=${TAG//-/}/; s/^_tag=.*/_tag=${TAG}/; s/^pkgrel=.*/pkgrel=1/" "$PKGBUILD"
+            grep -E '^(pkgver|_tag|pkgrel)=' "$PKGBUILD"
+          done
+
+      - name: Publish AUR package
+        if: steps.aur.outputs.configured == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: vocalinux
+          pkgbuild: packaging/aur/vocalinux/PKGBUILD
+          updpkgsums: 'true'
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: 'Release ${{ github.ref_name }}'
+
+  # Separate job: the -bin PKGBUILD pins digests of BOTH AppImages, and the
+  # aarch64 build attaches its asset after build-and-release returns. Waiting
+  # for it here keeps the source package publishing early while the binary
+  # package never curls a 404.
+  publish-aur-bin:
+    name: Publish -bin to AUR
+    needs: [publish-aur, build-appimage-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Check for AUR credentials
+        id: aur
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "AUR_SSH_PRIVATE_KEY not set; skipping (docs/AUR.md)"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout code
+        if: steps.aur.outputs.configured == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Bump PKGBUILD version
+        if: steps.aur.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKGBUILD=packaging/aur/vocalinux-bin/PKGBUILD
+          sed -i "s/^pkgver=.*/pkgver=${TAG//-/}/; s/^_tag=.*/_tag=${TAG}/; s/^pkgrel=.*/pkgrel=1/" "$PKGBUILD"
+          grep -E '^(pkgver|_tag|pkgrel)=' "$PKGBUILD"
+
+      # The -bin PKGBUILD carries per-arch sum arrays, but updpkgsums inside
+      # the publish action only regenerates the x86_64 one — pin both here so
+      # the published PKGBUILD never ships a stale aarch64 digest.
+      - name: Pin per-arch AppImage digests in the -bin PKGBUILD
+        if: steps.aur.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          for arch in x86_64 aarch64; do
+            url="https://github.com/VocaHQ/vocalinux/releases/download/${GITHUB_REF_NAME}/Vocalinux-${tag}-${arch}.AppImage"
+            sum="$(curl -fsSL "$url" | sha256sum | cut -d' ' -f1)"
+            sed -i "s/^sha256sums_${arch}=('[0-9a-f]*')/sha256sums_${arch}=('${sum}')/" \
+              packaging/aur/vocalinux-bin/PKGBUILD
+          done
+
+      - name: Publish AUR -bin package
+        if: steps.aur.outputs.configured == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@084b0d9b15415bf9cdb65d44dad1efe37a354050 # v4.2.0
+        with:
+          pkgname: vocalinux-bin
+          # The -bin PKGBUILD names local sources (vocalinux.desktop,
+          # vocalinux.svg, LICENSE); publishing the whole directory mirrors
+          # them into the AUR repo instead of shipping a lone PKGBUILD.
+          asset_dir: packaging/aur/vocalinux-bin
+          # Sums are pinned in the step above for BOTH arches; regenerating
+          # here would only refresh the x86_64 array.
+          updpkgsums: 'false'
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: 'Release ${{ github.ref_name }}'
+
+  # GitHub Release first, Store second. A super-privileged plug can still
+  # queue a human review and refuse edge/candidate; the .snap still
+  # has to land on the tag for sideload. grade: stable allows candidate; do
+  # not auto-release to stable — promote after QA via snap-promote.yml (#783).
+  # Secret: SNAPCRAFT_STORE_CREDENTIALS (snapcraft export-login).
+  build-snap:
+    name: Build Snap
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build snap
+        id: build
+        uses: snapcore/action-build@3bdaa03e1ba6bf59a65f84a751d943d549a54e79 # v1
+
+      - name: Upload the snap
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: snap-amd64
+          path: ${{ steps.build.outputs.snap }}
+          if-no-files-found: error
+          retention-days: 7
+
+  attach-snap:
+    name: Attach Snap
+    needs: [build-and-release, build-snap]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download the snap
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: snap-amd64
+          path: dist
+
+      - name: Attach to release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          ls -la dist/*.snap
+          gh release upload "$TAG" dist/*.snap \
+            --repo ${{ github.repository }} \
+            --clobber
+
+  publish-snap:
+    name: Publish Snap to Store
+    needs: build-snap
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Require Snap Store credentials
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          if [ -z "$SNAPCRAFT_STORE_CREDENTIALS" ]; then
+            echo "SNAPCRAFT_STORE_CREDENTIALS is unset; cannot publish the snap"
+            exit 1
+          fi
+
+      - name: Download the snap
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: snap-amd64
+          path: dist
+
+      - name: Locate the snap
+        id: snapfile
+        run: |
+          set -euo pipefail
+          file=$(ls dist/*.snap)
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          ls -la "$file"
+
+      - name: Install snapcraft
+        run: sudo snap install snapcraft --classic
+
+      - name: Publish snap to edge and candidate
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+          SNAP_FILE: ${{ steps.snapfile.outputs.file }}
+        run: |
+          set -euo pipefail
+          log=/tmp/snap-upload.log
+          set +e
+          /snap/bin/snapcraft upload "$SNAP_FILE" --release edge,candidate >"$log" 2>&1
+          status=$?
+          set -e
+          cat "$log"
+          if [ "$status" -eq 0 ]; then
+            exit 0
+          fi
+          if grep -E -q "will need manual review|human review required" "$log" \
+            && grep -F -q "allow-installation" "$log"; then
+            echo "::warning::Snap Store queued a human review (allow-installation). The .snap is on the GitHub Release."
+            exit 0
+          fi
+          if grep -F -q "Waiting for previous upload(s)" "$log"; then
+            echo "::error::Snap Store publish failed: an older upload is still in the review queue. Reject and remove it at https://dashboard.snapcraft.io/ (the upload page lists it), then re-run this job."
+            exit "$status"
+          fi
+          echo "::error::Snap Store publish failed (exit $status) for a reason other than allow-installation review."
+          exit "$status"
+
+  deploy-website:
+    name: Deploy Website
+    runs-on: ubuntu-latest
+    needs: [build-and-release, publish-pypi]
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: './web/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: ./web
+        run: npm ci || npm install
+
+      - name: Sync version from source code
+        run: |
+          VERSION=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/vocalinux/version.py)
+          echo "Syncing version: $VERSION"
+          # JSON-LD uses unquoted JS keys: softwareVersion: "x.y.z"
+          if grep -qE 'softwareVersion:\s*"' web/src/app/page.tsx; then
+            sed -i 's/softwareVersion: "[^"]*"/softwareVersion: "'"$VERSION"'"/' web/src/app/page.tsx
+            echo "Updated page.tsx version:"
+            grep -oP 'softwareVersion:\s*"\K[^"]+' web/src/app/page.tsx
+          elif grep -qE 'softwareVersion:\s*"' web/src/app/layout.tsx; then
+            sed -i 's/softwareVersion: "[^"]*"/softwareVersion: "'"$VERSION"'"/' web/src/app/layout.tsx
+            echo "Updated layout.tsx version:"
+            grep -oP 'softwareVersion:\s*"\K[^"]+' web/src/app/layout.tsx
+          else
+            echo "::warning::No softwareVersion field found in page.tsx or layout.tsx; skipping sync"
+          fi
+          # Update package.json version (remove -alpha/beta/rc suffix for npm)
+          NPM_VERSION=${VERSION%-*}
+          NPM_VERSION=${NPM_VERSION%-beta*}
+          NPM_VERSION=${NPM_VERSION%-rc*}
+          sed -i 's/"version": "[^"]*"/"version": "'"$NPM_VERSION"'"/' web/package.json
+          # Verify the changes
+          echo "Updated package.json version:"
+          grep -oP '"version":\s*"\K[^"]+' web/package.json
+
+      - name: Build and deploy website
+        working-directory: ./web
+        run: |
+          npm ci || npm install
+          npm run deploy
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./web/out
+          publish_branch: gh-pages
+          cname: vocalinux.com
+          force_orphan: true

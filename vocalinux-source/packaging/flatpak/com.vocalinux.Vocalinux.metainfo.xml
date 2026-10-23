@@ -1,0 +1,189 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.vocalinux.Vocalinux</id>
+
+  <name>Vocalinux</name>
+  <summary>Free, offline voice dictation for Linux</summary>
+  <developer id="com.vocalinux">
+    <name>Jatin K Malik</name>
+  </developer>
+
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-only</project_license>
+
+  <description>
+    <p>
+      Vocalinux is a privacy-first, fully offline voice dictation system for Linux.
+      Speak naturally and your words appear in any application — on X11 or Wayland —
+      using local speech recognition. No cloud, no data leaves your machine.
+      Speech recognition models are downloaded on first run.
+    </p>
+    <p>Features:</p>
+    <ul>
+      <li>Toggle or push-to-talk activation modes</li>
+      <li>Real-time transcription with minimal latency</li>
+      <li>Universal compatibility across all Linux applications</li>
+      <li>100% offline operation for privacy and reliability</li>
+      <li>whisper.cpp by default — high-performance C++ speech recognition</li>
+      <li>Universal GPU support via Vulkan (AMD, Intel, NVIDIA)</li>
+      <li>System tray integration with visual status indicators</li>
+      <li>Start on login support via XDG autostart</li>
+      <li>Pleasant audio feedback with smooth gliding tones</li>
+      <li>Graphical settings dialog for easy configuration</li>
+    </ul>
+    <p>
+      This Flatpak ships the whisper.cpp engine. On a Wayland session, text is
+      injected through XWayland.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">com.vocalinux.Vocalinux.desktop</launchable>
+
+  <categories>
+    <category>Utility</category>
+    <category>Accessibility</category>
+    <category>AudioVideo</category>
+  </categories>
+
+  <keywords>
+    <keyword>voice</keyword>
+    <keyword>typing</keyword>
+    <keyword>dictation</keyword>
+    <keyword>speech</keyword>
+    <keyword>recognition</keyword>
+    <keyword>transcription</keyword>
+    <keyword>accessibility</keyword>
+  </keywords>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Real-time voice-to-text transcription</caption>
+      <image>https://vocalinux.com/screenshots/00-transcription.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Speech engine settings</caption>
+      <image>https://vocalinux.com/screenshots/settings-speech-engine.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>System tray indicator</caption>
+      <image>https://vocalinux.com/screenshots/02-system-tray.png</image>
+    </screenshot>
+  </screenshots>
+
+  <url type="homepage">https://vocalinux.com</url>
+  <url type="bugtracker">https://github.com/VocaHQ/vocalinux/issues</url>
+  <url type="vcs-browser">https://github.com/VocaHQ/vocalinux</url>
+
+  <content_rating type="oars-1.1">
+    <content_attribute id="violence-cartoon">none</content_attribute>
+    <content_attribute id="violence-fantasy">none</content_attribute>
+    <content_attribute id="violence-realistic">none</content_attribute>
+    <content_attribute id="violence-bloodshed">none</content_attribute>
+    <content_attribute id="violence-sexual">none</content_attribute>
+    <content_attribute id="violence-desecration">none</content_attribute>
+    <content_attribute id="violence-slavery">none</content_attribute>
+    <content_attribute id="violence-worship">none</content_attribute>
+    <content_attribute id="drugs-alcohol">none</content_attribute>
+    <content_attribute id="drugs-narcotics">none</content_attribute>
+    <content_attribute id="drugs-tobacco">none</content_attribute>
+    <content_attribute id="sex-nudity">none</content_attribute>
+    <content_attribute id="sex-themes">none</content_attribute>
+    <content_attribute id="sex-homosexuality">none</content_attribute>
+    <content_attribute id="sex-prostitution">none</content_attribute>
+    <content_attribute id="sex-adultery">none</content_attribute>
+    <content_attribute id="sex-appearance">none</content_attribute>
+    <content_attribute id="language-profanity">none</content_attribute>
+    <content_attribute id="language-humor">none</content_attribute>
+    <content_attribute id="language-discrimination">none</content_attribute>
+    <content_attribute id="social-chat">none</content_attribute>
+    <content_attribute id="social-info">none</content_attribute>
+    <content_attribute id="social-audio">none</content_attribute>
+    <content_attribute id="social-location">none</content_attribute>
+    <content_attribute id="social-contacts">none</content_attribute>
+    <content_attribute id="money-purchasing">none</content_attribute>
+    <content_attribute id="money-gambling">none</content_attribute>
+  </content_rating>
+
+  <releases>
+    <release version="0.18.4" date="2026-10-21">
+      <description>
+        <p>Patch: long push-to-talk dictations are transcribed in segments instead of being cut off, model downloads only start after you confirm them and Cancel cancels the whole change, Test Dictation keeps its own result while the Dictation Pad is open, the GPU picker follows ggml's device list and CPU runs use most of your cores, the recording hotkey can cancel a transcription in progress, this Flatpak bundles onnxruntime for Silero VAD and uses the X11 hotkey listener on X11 sessions, RemoteDesktop portal requests no longer collide on GNOME, update checks can be turned off, and Slovenian is supported. This Flatpak still ships whisper.cpp only.</p>
+      </description>
+    </release>
+    <release version="0.18.3" date="2026-10-17">
+      <description>
+        <p>Patch: "new line" and "new paragraph" voice commands insert real line breaks standalone and mid-utterance, hotkeys work again on GNOME Shell X11 and quitting no longer collapses multi-layout keyboard maps, the bundled pywhispercpp builds at the portable x86-64 baseline so older CPUs stop crashing, and the Snap recipe drops the `uinput` plug the Store denied so revisions publish again. This Flatpak still ships whisper.cpp only.</p>
+      </description>
+    </release>
+    <release version="0.18.2" date="2026-10-12">
+      <description>
+        <p>Patch: the dictation overlay orb pulses and ripples with live microphone level, Nix gets a flake package with NixOS and Home Manager modules plus Vulkan GPU inference, keyboards with a held key or queued key events are left ungrabbed at startup so typing during launch cannot strand a key, bundled pywhispercpp drops -march=native so AppImage and Flatpak stop crashing on older CPUs, and the piped installer prompts via /dev/tty. This Flatpak still ships whisper.cpp only.</p>
+      </description>
+    </release>
+    <release version="0.18.1" date="2026-10-08">
+      <description>
+        <p>Patch: Settings Proxy page for model downloads and update checks behind SOCKS5/HTTP proxies, opt-in JSONL transcript persistence so a failed injection no longer loses the text, .deb and .rpm release packages for Debian and Fedora, and a slimmer tray menu with Start on Login and About living in Settings. Dictation pad windows no longer ghost away under Wayland compositors, keyboard discovery stops grabbing mice, touchpads, and power buttons, KDE Plasma 6 Wayland letter case is fixed, and the Speech Model picker stages changes until Download is confirmed instead of starting a fetch per click. This Flatpak still ships whisper.cpp only.</p>
+      </description>
+    </release>
+    <release version="0.18.0" date="2026-10-02">
+      <description>
+        <p>Minor: in-app Dictation Pad for Wayland-safe dictation, per-language dictation shortcuts, tray dictation history, file transcription with speaker labels, opt-in D-Bus activation for compositor global shortcuts, custom dictionary with corrections, postprocessing script hook, floating dictation overlay, audio ducking while dictating, and the dictation hotkey grabbed so it stops leaking into the focused app. PipeWire/system-audio capture and the RemoteDesktop portal injection backend are native-install paths; this Flatpak still ships whisper.cpp only.</p>
+      </description>
+    </release>
+    <release version="0.17.0" date="2026-09-16">
+      <description>
+        <p>Minor: Faster Whisper and Parakeet local engines, Speech Model simple setup, first-run system language, searchable open language picker, localized punctuation commands, bare function-key push-to-talk, Snap packaging with ydotool/uinput, Flatpak bundles attached by the release workflow, and XWayland/layout paste plus settings/audio fixes (HDA analog mics at native layout, native GTK OS dark/light, English-only models no longer trap other languages). This Flatpak still ships whisper.cpp only.</p>
+      </description>
+    </release>
+    <release version="0.16.2" date="2026-09-05">
+      <description>
+        <p>Stability patch: skip leftover IBus on KDE so dictation types into real apps, Wayland/IBus shortcuts via wtype and ydotool, real BackSpace for "delete that", Fedora/Arch installer glslc (not glslang), nightly version stamp before build, release integrity checksums and pinned builders, AUR PKGBUILD CI gate, distro CI plus docs drift fixes, and VocaGateway Beta on the site.</p>
+      </description>
+    </release>
+    <release version="0.16.1" date="2026-08-30">
+      <description>
+        <p>Stability patch: per-engine model size at startup, save the model only after it loaded, leftover-download list shows every row, one ConfigManager so Settings writes stick, tray stays idle after leftover transcription and can download the recommended model from the missing-model notification, Ctrl+Shift+V paste in terminals, GNOME XWayland layout after scoped IBus inject, Python 3.11 installer floor with verified model downloads, AppImage glibc that boots on Debian 12, AUR build against Arch extra setuptools 84, skip context_params on AUR pywhispercpp 1.4, and Settings/About layout polish.</p>
+      </description>
+    </release>
+    <release version="0.16.0" date="2026-08-23">
+      <description>
+        <p>In-app update checker with tray notifications, hold Right Alt push-to-talk default for new installs, searchable language list, delete unused downloaded speech models, family dictation tone picker (default Voca, family preview WAVs), Settings About page for this app, VocaHQ, and talk to us, AGPL-3.0 relicensing, shared Voca family mic for app/tray/site icons, hardened installer with Justfile and uv lockfiles (distro python3-gi required), Test Dictation missing-model message, and desktop reliability fixes for IBus, audio capture, clipboard restore, GPU/Vulkan selection, and AppImage GI typelibs.</p>
+      </description>
+    </release>
+    <release version="0.15.0" date="2026-07-28">
+      <description>
+        <p>Searchable sidebar settings with dictation controls in the sidebar footer, AppImage packages for x86_64 and aarch64, expanded speech-language catalog (including Hungarian), sentence capitalization and trailing spaces for continuous dictation, auto-pause and idle model unload, Vulkan discrete-GPU selection, ibus-wayland support on previously unbridged compositors, Bluetooth mic capture crash fix, custom-shortcut Record/Set restore, and desktop reliability fixes.</p>
+      </description>
+    </release>
+    <release version="0.14.2" date="2026-07-17">
+      <description>
+        <p>IBus stability (engine process launch after XDG path import; first-dictation FocusIn gate on GNOME Wayland) and settings dialog tabs that scroll so the window fits the monitor.</p>
+      </description>
+    </release>
+    <release version="0.14.1" date="2026-07-16">
+      <description>
+        <p>First Flathub-oriented packaging release: Flatpak with whisper.cpp + Vulkan, wl-copy/ydotool Wayland paste, evdev global hotkeys, AUR package, layout-aware shortcuts, and installer fixes.</p>
+      </description>
+    </release>
+    <release version="0.14.0-beta" date="2026-07-14">
+      <description>
+        <p>Vocalinux 0.14.0-beta as Flatpak: whisper.cpp with Vulkan, XDG config/models/logs, XWayland text injection, and system tray integration.</p>
+      </description>
+    </release>
+    <release version="0.12.0-beta" date="2026-06-07">
+      <description>
+        <p>First Flatpak release: whisper.cpp engine with Vulkan GPU support, XDG-compliant data paths, and XWayland text injection.</p>
+      </description>
+    </release>
+    <release version="0.11.0-beta" date="2026-05-30">
+      <description>
+        <p>Guided whisper.cpp model variants, hotplug keyboard rescanning, and IBus setup refinements.</p>
+      </description>
+    </release>
+    <release version="0.10.2-beta" date="2026-04-08">
+      <description>
+        <p>Non-ASCII text injection, IBus Wayland detection fixes, Pop!_OS dependency support, and code quality improvements.</p>
+      </description>
+    </release>
+  </releases>
+</component>

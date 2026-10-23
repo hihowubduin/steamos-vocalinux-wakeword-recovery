@@ -1,0 +1,86 @@
+name: Flatpak
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'packaging/flatpak/**'
+      - 'src/**'
+      - 'pyproject.toml'
+      # The dependency manifest is generated from the hash-pinned export, so a
+      # lock refresh moves what this build ships. Without this, `just lock`
+      # could change every version in it and start no Flatpak job.
+      - 'requirements/**'
+      - '.github/workflows/flatpak.yml'
+  pull_request:
+    branches: [ main, master ]
+    paths:
+      - 'packaging/flatpak/**'
+      # src/** is push-only. A text-injection PR already runs python-test;
+      # the Flatpak job's cost is compiling numpy and pywhispercpp from
+      # source, which those PRs do not change. main still builds src-only
+      # pushes so a sandbox install break fails the default branch.
+      - 'pyproject.toml'
+      # The dependency manifest is generated from the hash-pinned export, so a
+      # lock refresh moves what this build ships. Without this, `just lock`
+      # could change every version in it and start no Flatpak job.
+      - 'requirements/**'
+      - '.github/workflows/flatpak.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # matrix is not available in job-level if; build the arch list here instead.
+  # PRs: x86_64 only. main / workflow_dispatch: both arches.
+  matrix:
+    name: Resolve build matrix
+    runs-on: ubuntu-latest
+    outputs:
+      include: ${{ steps.set.outputs.include }}
+    steps:
+      - id: set
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo 'include=[{"arch":"x86_64","runner":"ubuntu-latest"}]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'include=[{"arch":"x86_64","runner":"ubuntu-latest"},{"arch":"aarch64","runner":"ubuntu-24.04-arm"}]' >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build Flatpak (${{ matrix.arch }})
+    needs: matrix
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.matrix.outputs.include) }}
+    container:
+      # Privileged builder: pin the OCI index, not the mutable gnome-50 tag.
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-50@sha256:1fb2df10a57276f90806e1f35454048e30bf1855b7b4ff4808c9ee55887bd852
+      options: --privileged
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build and bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@79327416609af08178ad73b352877e51450790b3 # v6
+        with:
+          bundle: vocalinux-${{ matrix.arch }}.flatpak
+          manifest-path: packaging/flatpak/com.vocalinux.Vocalinux.yml
+          # The action appends -${arch} and restore-keys is
+          # `flatpak-builder-${arch}`, so the key has to start with that
+          # prefix. Putting the packaging hash first made every lock
+          # refresh a full rebuild (numpy + pywhispercpp from source).
+          # github.sha in the key forced a full rebuild every run.
+          cache-key: flatpak-builder-${{ matrix.arch }}-${{ hashFiles('packaging/flatpak/**') }}
+          arch: ${{ matrix.arch }}
+          artifact-name: vocalinux-flatpak-${{ matrix.arch }}
+          # Flathub mirrors screenshots at submission time; mirror locally so the
+          # builddir linter does not flag the external screenshot URL.
+          mirror-screenshots-url: https://dl.flathub.org/media

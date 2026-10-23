@@ -1,0 +1,238 @@
+[build-system]
+# >=77 for the SPDX license string below. No upper bound: Arch extra
+# python-setuptools is 84, and the AUR PKGBUILD builds with --no-isolation.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vocalinux"
+dynamic = ["version"]
+description = "A seamless voice dictation system for Linux"
+readme = "README.md"
+license = "AGPL-3.0-only"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Jatin K Malik", email = "jatinkrmalik@gmail.com"}
+]
+maintainers = [
+    {name = "Jatin K Malik", email = "jatinkrmalik@gmail.com"}
+]
+requires-python = ">=3.11"
+keywords = [
+    "voice", "dictation", "speech", "recognition",
+    "linux", "accessibility", "voice-typing", "speech-to-text"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Environment :: X11 Applications :: GTK",
+    "Intended Audience :: End Users/Desktop",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Desktop Environment :: Gnome",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+    "Topic :: Text Processing",
+    "Topic :: Utilities",
+]
+dependencies = [
+    "pywhispercpp>=1.5.0,<2",
+    "pynput>=1.7.6,<2",
+    "evdev>=1.6.0,<2; sys_platform == 'linux'",
+    "requests>=2.28.0",
+    "PySocks>=1.7.1,<2",
+    "numpy>=1.22.0,<3",
+    "pyaudio>=0.2.13",
+    "PyGObject; sys_platform == 'linux'",
+    "psutil>=5.9.0,<8",
+]
+
+[project.optional-dependencies]
+vosk = [
+    "vosk>=0.3.45,<0.4",
+]
+whisper = [
+    "openai-whisper>=20231117",
+    "torch>=2.13.0",
+]
+parakeet = [
+    "sherpa-onnx>=1.12.0,<2",
+    # Match the locked sherpa-onnx version; bump both together. armv7l wheels omit this
+    # dependency metadata, and the export test enforces the matching core pin.
+    "sherpa-onnx-core==1.13.7; platform_machine != 'armv7l'",
+]
+faster_whisper = [
+    "faster-whisper>=1.0.0,<2",
+]
+vad = [
+    "onnxruntime>=1.16.0",
+]
+wakeword = [
+    "openwakeword @ git+https://github.com/dscripka/openWakeWord.git@368c03716d1e92591906a84949bc477f3a834455",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
+    "pytest-timeout>=2.1.0",
+    "pre-commit>=3.0.0",
+    "mypy>=1.0.0",
+    "pyyaml>=6.0,<7",
+]
+docs = [
+    "sphinx>=6.0.0",
+    "sphinx-rtd-theme>=1.2.0",
+]
+
+# Formatters and linters, deliberately outside the `dev` extra: `uv sync
+# --only-group lint` installs them without the project, so the lint job needs
+# no portaudio/girepository headers to build pyaudio and PyGObject.
+[dependency-groups]
+# install.sh installs this wheel-only toolchain before any source builds, then
+# disables build isolation so pip cannot resolve another unpinned environment.
+installer-build = [
+    "pip>=25.3,<27",
+    # Torch 2.13 supports setuptools 82+, so keep this at the patched version
+    # for setuptools' 2026 sdist normalization advisory.
+    "setuptools>=83",
+    "wheel",
+    "meson-python>=0.16",
+    "cmake==3.31.10",
+    "ninja==1.13.0",
+    "repairwheel",
+    "setuptools-scm>=8",
+]
+lint = [
+    "black>=23.0.0",
+    "isort>=5.12.0",
+    "flake8>=6.0.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+vocalinux = "vocalinux.main:main"
+
+[project.gui-scripts]
+vocalinux-gui = "vocalinux.main:main"
+
+[project.urls]
+Homepage = "https://github.com/VocaHQ/vocalinux"
+Documentation = "https://github.com/VocaHQ/vocalinux/tree/main/docs"
+Repository = "https://github.com/VocaHQ/vocalinux"
+Issues = "https://github.com/VocaHQ/vocalinux/issues"
+Changelog = "https://github.com/VocaHQ/vocalinux/releases"
+
+[tool.uv]
+# Lock/exports are generated with uv; keep the minor pinned so lockfile
+# upgrades are deliberate (see `just lock`).
+required-version = ">=0.12,<0.13"
+
+[tool.setuptools]
+# Resource dirs carry no .py files, but setuptools still treats them as packages.
+packages = [
+    "vocalinux",
+    "vocalinux.audio",
+    "vocalinux.gateway_embed",
+    "vocalinux.resources",
+    "vocalinux.resources.icons",
+    "vocalinux.resources.icons.scalable",
+    "vocalinux.resources.sounds",
+    "vocalinux.speech_recognition",
+    "vocalinux.speech_recognition.data",
+    "vocalinux.speech_recognition.engines",
+    "vocalinux.text_injection",
+    "vocalinux.ui",
+    "vocalinux.ui.keyboard_backends",
+    "vocalinux.utils",
+]
+package-dir = {"" = "src"}
+
+[tool.setuptools.dynamic]
+version = {attr = "vocalinux.version.__version__"}
+
+[tool.setuptools.package-data]
+"*" = ["*.svg", "*.wav", "*.onnx"]
+"vocalinux" = ["resources/**/*"]
+"vocalinux.speech_recognition" = ["data/*.onnx", "data/LICENSE"]
+"vocalinux.utils" = ["model_checksums.txt"]
+
+[tool.black]
+line-length = 100
+target-version = ['py311', 'py312', 'py313', 'py314']
+include = '\.pyi?$'
+exclude = '''
+/(
+    \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | venv
+  | _build
+  | buck-out
+  | build
+  | dist
+  | node_modules
+)/
+'''
+
+[tool.isort]
+profile = "black"
+line_length = 100
+skip_gitignore = true
+skip = [".git", "venv", "node_modules", "build", "dist"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers --timeout=10 --timeout_method=thread"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "integration: marks tests as integration tests",
+    "audio: marks tests that require audio hardware",
+]
+filterwarnings = [
+    "ignore:The NumPy module was reloaded:UserWarning",
+    "ignore:There is no current event loop:DeprecationWarning",
+]
+
+[tool.coverage.run]
+source = ["src"]
+branch = true
+omit = [
+    "*/tests/*",
+    "*/__pycache__/*",
+    # GTK dialog files are untestable without a real GTK environment
+    "*/settings_dialog.py",
+    "*/logging_dialog.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+    "if __name__ == .__main__.:",
+]
+show_missing = true
+
+[tool.mypy]
+# Target the supported floor so typechecking covers what requires-python promises.
+python_version = "3.11"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+exclude = ["venv", "build", "dist", "node_modules"]
+
+# numpy 2.x ships stubs written in 3.12 syntax, which a 3.11 target cannot parse.
+# We only pass arrays through, so skipping the stubs costs little compared to
+# type-checking against the Python version we actually promise to support.
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+follow_imports_for_stubs = true

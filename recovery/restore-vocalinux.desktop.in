@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Restore Vocalinux
+Comment=Reinstall the local Vocalinux wake-word build after a SteamOS update
+Exec=/usr/bin/konsole --hold -e /usr/bin/bash "@RECOVERY@/restore-vocalinux.sh"
+Icon=vocalinux
+Terminal=false
+StartupNotify=true
+Categories=System;

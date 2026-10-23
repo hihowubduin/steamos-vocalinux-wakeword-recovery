@@ -1,0 +1,59 @@
+import fs from "fs";
+import path from "path";
+
+describe("SEO Assets", () => {
+  const robotsPath = path.join(process.cwd(), "public", "robots.txt");
+  const sitemapPath = path.join(process.cwd(), "public", "sitemap.xml");
+
+  let robotsContent: string;
+  let sitemapContent: string;
+
+  beforeAll(() => {
+    robotsContent = fs.readFileSync(robotsPath, "utf-8");
+    sitemapContent = fs.readFileSync(sitemapPath, "utf-8");
+  });
+
+  it("contains sitemap reference in robots.txt", () => {
+    expect(robotsContent).toContain(
+      "Sitemap: https://vocalinux.com/sitemap.xml",
+    );
+  });
+
+  it("blocks crawler access to technical paths", () => {
+    expect(robotsContent).toContain("Disallow: /api/");
+    expect(robotsContent).toContain("Disallow: /out/");
+  });
+
+  it("does not block Next.js static assets needed for rendering", () => {
+    expect(robotsContent).not.toContain("Disallow: /_next/");
+  });
+
+  it("does not blanket-block query-string URLs", () => {
+    // Blocking all query strings causes GSC "Indexed, though blocked by robots.txt"
+    // for pages discovered with UTM/tracking params. Use canonicals instead.
+    const disallowRules = robotsContent
+      .split("\n")
+      .filter((line) => line.trimStart().startsWith("Disallow:"));
+    expect(disallowRules.some((line) => /\/\*\?\*/.test(line))).toBe(false);
+  });
+
+  it("includes core landing pages in sitemap", () => {
+    const expectedUrls = [
+      "https://vocalinux.com/",
+      "https://vocalinux.com/install/",
+      "https://vocalinux.com/install/ubuntu/",
+      "https://vocalinux.com/install/fedora/",
+      "https://vocalinux.com/install/arch/",
+      "https://vocalinux.com/compare/",
+      "https://vocalinux.com/remote-api/",
+      "https://vocalinux.com/voice-activity-detection/",
+      "https://vocalinux.com/advanced-settings/",
+      "https://vocalinux.com/desktop-reliability/",
+      "https://vocalinux.com/screenshots/",
+    ];
+
+    expectedUrls.forEach((url) => {
+      expect(sitemapContent).toContain(`<loc>${url}</loc>`);
+    });
+  });
+});

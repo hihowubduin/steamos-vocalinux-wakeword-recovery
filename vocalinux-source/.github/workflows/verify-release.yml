@@ -1,0 +1,36 @@
+name: Verify Published Release
+
+# The guards in tests/ read workflow files, so none of them can see a release
+# once its run has finished. This runs scripts/verify_release.py against the
+# real thing. It cannot see a later hand edit either, so re-run it by hand
+# after one: `just verify-release`.
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to verify (default: the latest stable release)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  attestations: read
+
+jobs:
+  verify:
+    name: Verify the published release
+    runs-on: ubuntu-latest
+    # No conclusion guard: v0.17.0 published seven assets from a run that
+    # failed on publish-snap, and the guard skipped it. --if-published covers
+    # the other direction, a run that published nothing.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Through the environment: a dispatch input is caller supplied text.
+          TAG: ${{ inputs.tag || github.event.workflow_run.head_branch }}
+          IF_PUBLISHED: ${{ github.event_name == 'workflow_run' && '--if-published' || '' }}
+        run: python3 scripts/verify_release.py "$TAG" ${IF_PUBLISHED:+"$IF_PUBLISHED"}

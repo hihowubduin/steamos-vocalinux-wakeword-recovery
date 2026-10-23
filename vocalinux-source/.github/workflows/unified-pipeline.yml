@@ -1,0 +1,531 @@
+name: Vocalinux CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  changes:
+    name: 🔎 Detect Changes
+    runs-on: ubuntu-latest
+    outputs:
+      web: ${{ steps.filter.outputs.web }}
+      python: ${{ steps.filter.outputs.python }}
+      aur: ${{ steps.filter.outputs.aur }}
+      native: ${{ steps.filter.outputs.native }}
+      deploy_website: ${{ steps.deploy_check.outputs.deploy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        id: filter
+        with:
+          filters: |
+            web:
+              - 'web/**'
+              - '.github/workflows/unified-pipeline.yml'
+            python:
+              - 'src/**'
+              - 'tests/**'
+              - 'pyproject.toml'
+              # 'requirements*.txt' does not match requirements/runtime.txt: a
+              # glob star stops at the slash. The exports and the AppImage build
+              # gate the same jobs, so a change to either has to reach them.
+              - 'requirements/**'
+              - 'packaging/appimage/**'
+              - 'uv.lock'
+              # These three end up inside the AppImage: build.sh reads the
+              # pywhispercpp pin out of install.sh and installs the desktop
+              # entry and the icon into the AppDir.
+              - 'install.sh'
+              - 'install.d/**'
+              - 'vocalinux.desktop'
+              - 'resources/**'
+              - 'justfile'
+              # scripts/ is guarded by tests/ and one of them is executed by the
+              # lint job: a scripts-only change that skipped this filter would
+              # skip both the checker and the tests that validate it.
+              - 'scripts/**'
+              - '.pre-commit-config.yaml'
+              - '.github/workflows/unified-pipeline.yml'
+            # The AUR gate builds packaging/aur/vocalinux/PKGBUILD from this
+            # tree. Its depends= mirror pyproject.toml, so every python change
+            # reaches the gate through the python filter above; this filter
+            # exists so a PKGBUILD-only change runs the gate without dragging
+            # the whole python matrix along.
+            aur:
+              - 'packaging/aur/**'
+              - '.github/workflows/unified-pipeline.yml'
+            # Same carve-out for the .deb/.rpm gate: nfpm.yaml mirrors
+            # pyproject.toml's dependencies against distro package names, so a
+            # native-only change runs its own build and smoke without the
+            # python matrix.
+            native:
+              - 'packaging/native/**'
+              - '.github/workflows/unified-pipeline.yml'
+      - name: Check if website should deploy
+        id: deploy_check
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          # Deploy if web files changed OR python files changed (for version updates)
+          # Use heredoc to safely handle multi-line commit messages
+          COMMIT_MSG_FILE=$(mktemp)
+          printenv COMMIT_MESSAGE > "$COMMIT_MSG_FILE"
+
+          # Use case-insensitive matching with grep
+          if [[ "${{ steps.filter.outputs.web }}" == "true" ]] || \
+             [[ "${{ steps.filter.outputs.python }}" == "true" ]] || \
+             [[ "${{ github.event_name }}" == "workflow_dispatch" ]] || \
+             grep -iE "(feat\(website\)|docs\(website\)|chore\(website\)|fix\(website\)|refactor\(website\))" "$COMMIT_MSG_FILE"; then
+            echo "deploy=true" >> $GITHUB_OUTPUT
+          else
+            echo "deploy=false" >> $GITHUB_OUTPUT
+          fi
+          rm -f "$COMMIT_MSG_FILE"
+
+  python-lint:
+    name: 🔍 Lint Python
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+
+      # --only-group lint installs the linters without the project itself, so
+      # this job needs no portaudio/girepository headers to build pyaudio and
+      # PyGObject. --locked fails if uv.lock drifts from pyproject.toml, so the
+      # tool versions are the ones `just lint` uses locally.
+      - name: Lint with flake8 (critical errors)
+        run: |
+          uv run --locked --only-group lint flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Check formatting with black
+        run: |
+          uv run --locked --only-group lint black --check --diff src/ tests/
+
+      - name: Check import sorting with isort
+        run: |
+          uv run --locked --only-group lint isort --check-only --diff --profile black src/ tests/
+
+      - name: Type check (mypy)
+        run: |
+          uv run --locked --only-group lint mypy src/
+
+      # --locked above fails when uv.lock drifts from pyproject.toml; nothing
+      # covered the step after that one. The exports are hash-pinned copies of
+      # the lock written by `just lock`, and no workflow ever re-ran it, so one
+      # could sit behind the lock indefinitely. `uv export` reads the lock and
+      # nothing else, so this needs neither the network nor the system headers
+      # the test matrix installs, which is why it rides here.
+      - name: Exports match uv.lock
+        run: python3 scripts/check_exports.py
+
+  python-test:
+    name: 🧪 Test Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [changes, python-lint]
+    if: needs.changes.outputs.python == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Every version requires-python promises; keep in sync with the
+        # classifiers in pyproject.toml (tests/test_python_version_policy.py).
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          enable-cache: true
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            xdotool \
+            gir1.2-appindicator3-0.1 \
+            libcairo2-dev \
+            pkg-config \
+            python3-dev \
+            libgirepository1.0-dev \
+            gobject-introspection \
+            libcairo-gobject2 \
+            gir1.2-gtk-3.0 \
+            portaudio19-dev
+
+      - name: Install GObject introspection dependencies
+        run: |
+          sudo apt-get update
+          # For Ubuntu 24.04+ (or the latest GitHub Actions runner image)
+          sudo apt-get install -y gir1.2-glib-2.0 libgirepository-2.0-dev pkg-config
+          # Alternatively, for older Ubuntu versions (like 22.04), you might need:
+          # sudo apt-get install -y libgirepository1.0-dev pkg-config
+
+      # PyGObject is built from the lock here: the runner has glib 2.80+ and the
+      # -dev headers installed above. End users get the distro package instead
+      # (install.sh builds venv/ with --system-site-packages).
+      - name: Install dependencies from uv.lock
+        run: uv sync --locked --extra dev --extra vad
+
+      - name: Run tests with coverage
+        run: |
+          # Set GI_TYPELIB_PATH so pip-installed PyGObject can find system typelibs (AppIndicator3, etc.)
+          # Use dynamic detection for cross-distro compatibility, fallback to common Ubuntu paths
+          export GI_TYPELIB_PATH=$(pkg-config --variable=typelibdir gobject-introspection-1.0 2>/dev/null || echo "/usr/lib/x86_64-linux-gnu/girepository-1.0:/usr/lib/girepository-1.0")
+          PYTHONPATH=$PWD uv run --locked --extra dev --extra vad pytest --junitxml=junit-${{ matrix.python-version }}.xml --cov=src --cov-report=xml tests/
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: test-results-${{ matrix.python-version }}
+          path: junit-${{ matrix.python-version }}.xml
+
+      - name: Upload coverage to Codecov
+        if: matrix.python-version == '3.13'
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: coverage.xml
+          fail_ci_if_error: false
+
+  just-contributor-path:
+    name: 🧰 Contributor Path (just)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    needs: [changes, python-lint]
+    if: needs.changes.outputs.python == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          # Caches uv's download cache, not .venv/, so the checkout below stays
+          # the fresh clone this job exists to exercise.
+          enable-cache: true
+
+      - name: Install just
+        run: |
+          uv tool install rust-just
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgirepository-2.0-dev \
+            libcairo2-dev \
+            pkg-config \
+            python3-dev \
+            portaudio19-dev \
+            gir1.2-gtk-3.0 \
+            gir1.2-appindicator3-0.1 \
+            xdotool
+
+      # The rest of the pipeline drives uv directly, so nothing here checks that
+      # the workflow CONTRIBUTING documents still works. `just deps` is skipped on
+      # purpose: running it first would populate .venv/ and hide exactly the
+      # breakage this job is for, where `uv run --no-sync` finds no interpreter to
+      # run the tooling with.
+      - name: just test, from a clean checkout
+        run: just test
+
+  appimage-smoke-test:
+    name: 📦 Build AppImage (smoke test, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: changes
+    if: needs.changes.outputs.python == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-latest
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+          ls -la dist/
+
+      # glslc and the pywhispercpp Vulkan rebuild are native artifacts. Neither
+      # depends on this commit: the id script keys them to the base image,
+      # tool_checksums.txt, and the pywhispercpp pin.
+      - name: AppImage native cache id
+        id: native-cache
+        run: |
+          set -euo pipefail
+          id="$(bash packaging/appimage/native-cache-id.sh)"
+          echo "id=${id}" >> "$GITHUB_OUTPUT"
+
+      - name: Cache AppImage build tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/vocalinux-appimage
+          key: appimage-native-${{ runner.arch }}-${{ steps.native-cache.outputs.id }}
+
+      - name: Build AppImage
+        env:
+          VOCALINUX_APPIMAGE_REQUIRE_VULKAN: "1"
+        run: |
+          VERSION=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/vocalinux/version.py)
+          WHEEL=$(ls dist/*.whl)
+          bash packaging/appimage/docker-build.sh "$WHEEL" "$VERSION" dist
+          ls -la dist/*.AppImage
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vocalinux-appimage-${{ matrix.arch }}
+          path: dist/*.AppImage
+          retention-days: 7
+
+  # The build host cannot see what breaks here: its libraries match what it
+  # bundled. Two regressions reached a user that way (#743) — one loading a GI
+  # library, one spawning a host binary — and both die on the new distros below.
+  # Old ones prove the glibc floor the build image sets.
+  appimage-boot-test:
+    name: 🐧 Boot AppImage (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    needs: [changes, appimage-smoke-test]
+    if: needs.changes.outputs.python == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - debian:12
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - fedora:42
+          - archlinux:latest
+          - opensuse/tumbleweed
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the AppImage built above
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: vocalinux-appimage-x86_64
+          path: dist
+
+      - name: Boot it on ${{ matrix.distro }}
+        run: |
+          APPIMAGE=$(ls dist/*.AppImage)
+          chmod +x "$APPIMAGE"
+          docker run --rm \
+            -v "$PWD/dist:/dist:ro" \
+            -v "$PWD/packaging/appimage:/pk:ro" \
+            "${{ matrix.distro }}" \
+            bash /pk/boot-test.sh "/dist/$(basename "$APPIMAGE")"
+
+  # Nothing built the PKGBUILD before a tag pushed it to AUR users, which is
+  # how #757 shipped: Arch's setuptools 84 against our old <82 cap. The gate
+  # swaps the not-yet-existing tag tarball for a git archive of the checkout,
+  # so it answers whether *this commit* builds on Arch. Deliberately
+  # archlinux:latest: the AUR is a rolling channel and #757 was Arch moving
+  # under us.
+  aur-build-test:
+    name: 🏛️ Build AUR package (gate)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.python == 'true' || needs.changes.outputs.aur == 'true'
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build the PKGBUILD on Arch
+        run: |
+          docker run --rm \
+            -v "$PWD:/repo:ro" \
+            archlinux:latest \
+            bash /repo/packaging/aur/build-test.sh
+
+  # The .deb and .rpm exist to be installed and run, so the gate does exactly
+  # that: build both in the pinned Debian 12 image release.yml uses, then
+  # install them in distro containers and run vocalinux --version plus an
+  # import smoke. debian:12 and ubuntu:24.04 exercise the .deb's dependency
+  # list (and the vendored cp311/cp312 wheels), fedora:42 the .rpm's.
+  native-build:
+    name: 📦 Build native packages (x86_64)
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.python == 'true' || needs.changes.outputs.native == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+          ls -la dist/
+
+      - name: Build .deb and .rpm
+        run: |
+          VERSION=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/vocalinux/version.py)
+          WHEEL=$(ls dist/*.whl)
+          bash packaging/native/docker-build.sh "$WHEEL" "$VERSION" dist
+          ls -la dist/*.deb dist/*.rpm
+
+      - name: Upload the x86_64 packages
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-x86_64
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          retention-days: 7
+
+  native-smoke:
+    name: 🐧 Install native package (${{ matrix.distro }})
+    runs-on: ubuntu-latest
+    needs: [changes, native-build]
+    if: needs.changes.outputs.python == 'true' || needs.changes.outputs.native == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        distro:
+          - debian:12
+          - ubuntu:24.04
+          - fedora:42
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download the packages built above
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: native-x86_64
+          path: dist
+
+      - name: Install and smoke on ${{ matrix.distro }}
+        run: |
+          docker run --rm \
+            -v "$PWD/dist:/out:ro" \
+            -v "$PWD/packaging/native:/pk:ro" \
+            "${{ matrix.distro }}" \
+            bash /pk/smoke-test.sh
+
+  web-build:
+    name: 🌐 Build Website
+    runs-on: ubuntu-latest
+    needs: changes
+    if: needs.changes.outputs.deploy_website == 'true'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: './web/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: ./web
+        run: npm ci || npm install
+
+      - name: Sync version from source code
+        run: |
+          VERSION=$(grep -oP '__version__\s*=\s*"\K[^"]+' src/vocalinux/version.py)
+          echo "Syncing version: $VERSION"
+          # JSON-LD uses unquoted JS keys: softwareVersion: "x.y.z"
+          if grep -qE 'softwareVersion:\s*"' web/src/app/page.tsx; then
+            sed -i 's/softwareVersion: "[^"]*"/softwareVersion: "'"$VERSION"'"/' web/src/app/page.tsx
+            echo "Updated page.tsx version:"
+            grep -oP 'softwareVersion:\s*"\K[^"]+' web/src/app/page.tsx
+          elif grep -qE 'softwareVersion:\s*"' web/src/app/layout.tsx; then
+            sed -i 's/softwareVersion: "[^"]*"/softwareVersion: "'"$VERSION"'"/' web/src/app/layout.tsx
+            echo "Updated layout.tsx version:"
+            grep -oP 'softwareVersion:\s*"\K[^"]+' web/src/app/layout.tsx
+          else
+            echo "::warning::No softwareVersion field found in page.tsx or layout.tsx; skipping sync"
+          fi
+          # Update package.json version (remove -alpha suffix for npm)
+          NPM_VERSION=${VERSION%-*}
+          sed -i 's/"version": "[^"]*"/"version": "'"$NPM_VERSION"'"/' web/package.json
+          # Verify the changes
+          echo "Updated package.json version:"
+          grep -oP '"version":\s*"\K[^"]+' web/package.json
+
+      - name: Lint
+        working-directory: ./web
+        run: npm run lint || true
+
+      - name: Type check
+        working-directory: ./web
+        run: npm run test:types || true
+
+      - name: Build
+        working-directory: ./web
+        run: npm run build
+
+  deploy-website:
+    name: 🚀 Deploy Website
+    runs-on: ubuntu-latest
+    needs: [changes, web-build]
+    if: |
+      always() &&
+      github.ref == 'refs/heads/main' &&
+      needs.changes.outputs.deploy_website == 'true' &&
+      needs.web-build.result == 'success'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: '24'
+          cache: 'npm'
+          cache-dependency-path: './web/package-lock.json'
+
+      - name: Install and build
+        working-directory: ./web
+        run: |
+          npm ci || npm install
+          npm run deploy
+
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@84c30a85c19949d7eee79c4ff27748b70285e453 # v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./web/out
+          publish_branch: gh-pages
+          cname: vocalinux.com
+          force_orphan: true
